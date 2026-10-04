@@ -1,0 +1,192 @@
+import os
+import sqlite3
+from datetime import datetime
+from flask import Flask, jsonify, render_template, request
+
+app = Flask(__name__)
+DB_PATH = os.getenv("DB_PATH", "chatbox.db")
+
+QUESTIONS = {
+    "vehicle": "¿Qué vehículo te interesa?",
+    "buyer": "¿La unidad sería para vos? Respondé: personal, tercero o reventa.",
+    "transfer": "¿A nombre de quién se realizaría la transferencia? Respondé: mi nombre, otra persona o no transferir.",
+    "accept_transfer": "Para retirar la unidad es obligatorio realizar la transferencia. ¿Estás de acuerdo? Respondé sí o no.",
+    "payment": "¿Cómo sería la compra? Respondé: contado, financiación o entrego usado.",
+    "name": "Perfecto. ¿Cuál es tu nombre y apellido?",
+}
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT UNIQUE NOT NULL,
+                name TEXT,
+                vehicle TEXT,
+                buyer_type TEXT,
+                transfer_to TEXT,
+                accepts_transfer INTEGER,
+                payment TEXT,
+                score INTEGER DEFAULT 50,
+                status TEXT DEFAULT 'IN_PROGRESS',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+
+def normalize(text):
+    return (text or "").strip().lower()
+
+
+def score_lead(lead):
+    score = 50
+    buyer = normalize(lead.get("buyer_type"))
+    transfer = normalize(lead.get("transfer_to"))
+    payment = normalize(lead.get("payment"))
+
+    if "personal" in buyer:
+        score += 20
+    if "reventa" in buyer or "revendedor" in buyer:
+        score -= 50
+    if "mi nombre" in transfer:
+        score += 20
+    if "otra" in transfer or "tercero" in transfer:
+        score -= 10
+    if "no transfer" in transfer:
+        score -= 60
+    if lead.get("accepts_transfer") == 1:
+        score += 20
+    elif lead.get("accepts_transfer") == 0:
+        score -= 80
+    if "contado" in payment:
+        score += 5
+
+    return max(0, min(100, score))
+
+
+def get_lead(session_id):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM leads WHERE session_id = ?", (session_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def save(session_id, **fields):
+    now = datetime.utcnow().isoformat()
+    with db() as conn:
+        exists = conn.execute("SELECT id FROM leads WHERE session_id = ?", (session_id,)).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO leads(session_id, created_at, updated_at) VALUES (?, ?, ?)",
+                (session_id, now, now),
+            )
+        if fields:
+            fields["updated_at"] = now
+            clause = ", ".join(f"{key} = ?" for key in fields)
+            conn.execute(
+                f"UPDATE leads SET {clause} WHERE session_id = ?",
+                (*fields.values(), session_id),
+            )
+
+
+def next_step(lead):
+    if not lead.get("vehicle"):
+        return "vehicle"
+    if not lead.get("buyer_type"):
+        return "buyer"
+    if not lead.get("transfer_to"):
+        return "transfer"
+    if lead.get("accepts_transfer") is None:
+        return "accept_transfer"
+    if lead.get("accepts_transfer") == 0:
+        return "rejected"
+    if not lead.get("payment"):
+        return "payment"
+    if not lead.get("name"):
+        return "name"
+    return "complete"
+
+
+def process_message(session_id, message):
+    lead = get_lead(session_id)
+    if not lead:
+        save(session_id)
+        return {"reply": "¡Hola! 👋 Soy el asistente de ventas. Te voy a hacer unas preguntas rápidas para ayudarte con tu consulta.\n\n" + QUESTIONS["vehicle"], "status": "IN_PROGRESS"}
+
+    step = next_step(lead)
+    text = normalize(message)
+
+    if step == "vehicle":
+        save(session_id, vehicle=message.strip())
+    elif step == "buyer":
+        save(session_id, buyer_type=message.strip())
+    elif step == "transfer":
+        save(session_id, transfer_to=message.strip())
+    elif step == "accept_transfer":
+        yes = text in {"si", "sí", "s", "yes"} or text.startswith("si ") or text.startswith("sí ")
+        no = text in {"no", "n"} or text.startswith("no ")
+        if not yes and not no:
+            return {"reply": "Necesito confirmar este punto. ¿Aceptás realizar la transferencia? Respondé sí o no.", "status": "IN_PROGRESS"}
+        save(session_id, accepts_transfer=1 if yes else 0)
+    elif step == "payment":
+        save(session_id, payment=message.strip())
+    elif step == "name":
+        save(session_id, name=message.strip())
+
+    lead = get_lead(session_id)
+    score = score_lead(lead)
+    save(session_id, score=score)
+    lead = get_lead(session_id)
+    step = next_step(lead)
+
+    if step == "rejected":
+        save(session_id, status="REJECTED")
+        return {"reply": "Gracias por tu consulta. Actualmente las unidades se comercializan únicamente realizando la transferencia correspondiente, por lo que no podemos continuar con esta operación.", "status": "REJECTED", "score": score}
+
+    if step == "complete":
+        status = "QUALIFIED" if score >= 60 else "REVIEW"
+        save(session_id, status=status)
+        msg = "¡Gracias! Ya tengo los datos necesarios. "
+        msg += "Un asesor comercial continuará con tu consulta." if status == "QUALIFIED" else "Vamos a revisar tu consulta antes de derivarla a un asesor."
+        return {"reply": msg, "status": status, "score": score}
+
+    return {"reply": QUESTIONS[step], "status": "IN_PROGRESS", "score": score}
+
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+
+@app.post("/api/chat")
+def chat():
+    payload = request.get_json(force=True)
+    session_id = str(payload.get("session_id", "demo"))
+    message = str(payload.get("message", ""))
+    return jsonify(process_message(session_id, message))
+
+
+@app.get("/api/leads")
+def leads():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM leads ORDER BY id DESC").fetchall()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/reset/<session_id>")
+def reset(session_id):
+    with db() as conn:
+        conn.execute("DELETE FROM leads WHERE session_id = ?", (session_id,))
+    return jsonify({"ok": True})
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
