@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Chatbox · Filtro comercial</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:Arial,sans-serif;background:#0b141a;color:#e9edef;display:grid;place-items:center;min-height:100vh}
+    .phone{width:min(430px,94vw);height:780px;max-height:94vh;background:#111b21;border-radius:28px;overflow:hidden;box-shadow:0 24px 70px #0008;display:flex;flex-direction:column}
+    header{padding:18px 20px;background:#202c33;font-weight:700} header small{display:block;font-weight:400;color:#8696a0;margin-top:4px}
+    #chat{flex:1;overflow:auto;padding:18px;background:linear-gradient(#0b141acc,#0b141acc)}
+    .bubble{max-width:82%;padding:10px 12px;border-radius:10px;margin:8px 0;line-height:1.35;white-space:pre-wrap}.bot{background:#202c33}.me{background:#005c4b;margin-left:auto}
+    footer{display:flex;gap:8px;padding:10px;background:#202c33} input{flex:1;border:0;border-radius:20px;padding:12px 15px;background:#2a3942;color:white;outline:none}button{border:0;border-radius:20px;padding:0 18px;font-weight:700;cursor:pointer}
+    .tools{padding:8px 12px;background:#111b21;text-align:right}.tools button{padding:7px 12px}.status{font-size:12px;color:#8696a0;margin:4px 2px 10px}
+  </style>
+</head>
+<body>
+<div class="phone">
+  <header>Concesionaria · Asistente <small>Simulador de calificación de leads</small></header>
+  <div class="tools"><button onclick="resetChat()">Nueva conversación</button></div>
+  <main id="chat"></main>
+  <footer><input id="msg" placeholder="Escribí un mensaje..." autocomplete="off"><button onclick="send()">Enviar</button></footer>
+</div>
+<script>
+let sessionId = crypto.randomUUID();
+const chat = document.getElementById('chat');
+const input = document.getElementById('msg');
+function bubble(text, cls){const d=document.createElement('div');d.className='bubble '+cls;d.textContent=text;chat.appendChild(d);chat.scrollTop=chat.scrollHeight}
+function status(data){if(data.score===undefined)return;const d=document.createElement('div');d.className='status';d.textContent=`Estado interno: ${data.status} · Score ${data.score}/100`;chat.appendChild(d)}
+async function call(message){const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,message})});const data=await r.json();bubble(data.reply,'bot');status(data)}
+async function send(){const text=input.value.trim();if(!text)return;bubble(text,'me');input.value='';await call(text)}
+async function resetChat(){await fetch('/api/reset/'+sessionId,{method:'POST'});sessionId=crypto.randomUUID();chat.innerHTML='';await call('hola')}
+input.addEventListener('keydown',e=>{if(e.key==='Enter')send()});
+call('hola');
+</script>
+</body>
+</html>
